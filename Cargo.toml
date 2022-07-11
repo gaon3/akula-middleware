@@ -1,0 +1,19 @@
+[package]
+name = "akula-middleware"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+akula = { git = "https://github.com/akula-bft/akula" }
+ethers = { git = "https://github.com/gakonst/ethers-rs" }
+anyhow = "1.0.58"
+thiserror = "1.0.31"
+async-trait = "0.1.56"
+ethereum-jsonrpc = { git = "https://github.com/rust-ethereum/jsonrpc" }
+
+[patch.crates-io]
+arrayvec = { git = "https://github.com/vorot93/arrayvec", branch = "pop-unchecked" }
+enr = { git = "https://github.com/rust-ethereum/enr" }
+ethnum = { git = "https://github.com/vorot93/ethnum-rs", branch = "impls" }
