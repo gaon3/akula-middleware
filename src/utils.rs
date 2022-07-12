@@ -8,12 +8,11 @@ use akula::{
 use ethereum_jsonrpc::types as jsonrpc;
 use ethers::{providers::Middleware, types as ethers_types};
 
-pub fn open_database(
-    db_path: impl Into<AkulaDataDir>,
-) -> anyhow::Result<MdbxWithDirHandle<NoWriteMap>> {
+pub fn open_database(db_path: AkulaDataDir) -> anyhow::Result<MdbxWithDirHandle<NoWriteMap>> {
+    let akula_chain_data_dir = db_path.chain_data_dir();
     let db: MdbxWithDirHandle<NoWriteMap> = MdbxEnvironment::<NoWriteMap>::open_ro(
         libmdbx::Environment::new(),
-        &db_path.into(),
+        &akula_chain_data_dir,
         akula::kv::tables::CHAINDATA_TABLES.clone(),
     )?
     .into();
@@ -50,7 +49,7 @@ pub fn ethers_typed_tx_to_message_call<M: Middleware>(
             ethers_types::NameOrAddress::Address(addr) => Some(*addr),
             ethers_types::NameOrAddress::Name(_) => {
                 return Err(AkulaMiddlewareError::ConversionError(String::from(
-                    "can't convert None to Address",
+                    "can't convert ENS name to Address",
                 )));
             }
         }
