@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
     let db = akula_middleware::open_database(path.parse()?)?;
 
     let provider = Provider::<Http>::try_from(
-        "https://eth-mainnet.g.alchemy.com/v2/mG-WsFAIf4ZL3oMa17m-q4RED_KsmObX",
+        "YOUR_PROVIDER",
     )?;
     let provider = Arc::new(provider);
 
