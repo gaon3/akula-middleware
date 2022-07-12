@@ -1,15 +1,13 @@
-use akula::{
-    kv::{mdbx::*, tables, MdbxWithDirHandle},
-    stagedsync::stages::FINISH,
-};
-use anyhow::format_err;
+use akula::kv::{mdbx::*, MdbxWithDirHandle};
 use async_trait::async_trait;
 use ethers::{
     providers::{FromErr, Middleware},
-    types::*,
+    types::{transaction::eip2718::TypedTransaction, *},
 };
 use std::sync::Arc;
 use thiserror::Error;
+
+pub use ethereum_jsonrpc::types as jsonrpc;
 
 use crate::{db_wrapper::DbWrapper, utils};
 
@@ -71,16 +69,22 @@ where
         &self.inner
     }
 
+    async fn get_block_number(&self) -> Result<U64, Self::Error> {
+        self.db_wrapper
+            .block_number()
+            .await
+            .map_err(AkulaMiddlewareError::DbWrapperError)
+    }
+
     async fn call(
         &self,
-        tx: &ethers::types::transaction::eip2718::TypedTransaction,
-        block: Option<ethers::types::BlockId>,
+        tx: &TypedTransaction,
+        block: Option<BlockId>,
     ) -> Result<Bytes, Self::Error> {
-        let block_id = if let Some(block_id) = block {
-            utils::ethers_block_id_to_akula(block_id)
-        } else {
-            ethereum_jsonrpc::types::BlockId::Number(ethereum_jsonrpc::types::BlockNumber::Latest)
-        };
+        let block_id = block.map_or(
+            jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Latest),
+            |block_id| utils::ethers_block_id_to_akula(block_id),
+        );
         let message_call = utils::ethers_typed_tx_to_message_call(tx)?;
 
         self.db_wrapper
@@ -88,7 +92,150 @@ where
             .await
             .map_or_else(
                 |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
-                |res| Ok(ethers::types::Bytes::from(Vec::from(res.as_ref()))),
+                |v| Ok(Bytes::from(v.0)),
             )
+    }
+
+    async fn estimate_gas(&self, tx: &TypedTransaction) -> Result<U256, Self::Error> {
+        let message_call = utils::ethers_typed_tx_to_message_call(tx)?;
+
+        self.db_wrapper
+            .estimate_gas(message_call, jsonrpc::BlockNumber::Latest)
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(U256::from(v.as_u64())),
+            )
+    }
+
+    async fn get_balance<T>(&self, from: T, block: Option<BlockId>) -> Result<U256, Self::Error>
+    where
+        T: Into<NameOrAddress> + Send + Sync,
+    {
+        let from = match from.into() {
+            NameOrAddress::Name(ens_name) => self
+                .inner
+                .resolve_name(&ens_name)
+                .await
+                .map_err(AkulaMiddlewareError::MiddlewareError)?,
+            NameOrAddress::Address(addr) => addr,
+        };
+        let block_id = block.map_or(
+            jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Latest),
+            |block_id| utils::ethers_block_id_to_akula(block_id),
+        );
+
+        self.db_wrapper
+            .get_balance(from, block_id)
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(utils::ethnum_u256_to_ethers(&v)),
+            )
+    }
+
+    async fn get_block<T>(
+        &self,
+        block_hash_or_number: T,
+    ) -> Result<Option<Block<TxHash>>, Self::Error>
+    where
+        T: Into<BlockId> + Send + Sync,
+    {
+        let block_id = utils::ethers_block_id_to_akula(block_hash_or_number.into());
+        self.db_wrapper
+            .get_block(block_id, false)
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(v.map(|block| utils::jsonrpc_block_with_hashes_to_ethers(block))),
+            )
+    }
+
+    async fn get_block_with_txs<T>(
+        &self,
+        block_hash_or_number: T,
+    ) -> Result<Option<Block<Transaction>>, Self::Error>
+    where
+        T: Into<BlockId> + Send + Sync,
+    {
+        let block_id = utils::ethers_block_id_to_akula(block_hash_or_number.into());
+        self.db_wrapper
+            .get_block(block_id, false)
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(v.map(|block| utils::jsonrpc_block_with_txs_to_ethers(block))),
+            )
+    }
+
+    async fn get_transaction<T: Into<TxHash> + Send + Sync>(
+        &self,
+        transaction_hash: T,
+    ) -> Result<Option<Transaction>, Self::Error> {
+        self.db_wrapper
+            .get_transaction_by_hash(transaction_hash.into())
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(v.map(|tx| utils::jsonrpc_tx_to_ethers(&tx))),
+            )
+    }
+
+    async fn get_storage_at<T>(
+        &self,
+        from: T,
+        location: H256,
+        block: Option<BlockId>,
+    ) -> Result<H256, Self::Error>
+    where
+        T: Into<NameOrAddress> + Send + Sync,
+    {
+        let at = match from.into() {
+            NameOrAddress::Name(ens_name) => self
+                .inner
+                .resolve_name(&ens_name)
+                .await
+                .map_err(AkulaMiddlewareError::MiddlewareError)?,
+            NameOrAddress::Address(addr) => addr,
+        };
+        let block_id = block.map_or(
+            jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Latest),
+            |block_id| utils::ethers_block_id_to_akula(block_id),
+        );
+
+        self.db_wrapper
+            .get_storage_at(
+                at,
+                akula::models::U256::from_be_bytes(*location.as_fixed_bytes()),
+                block_id,
+            )
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(H256(v.to_be_bytes())),
+            )
+    }
+
+    async fn get_code<T>(&self, at: T, block: Option<BlockId>) -> Result<Bytes, Self::Error>
+    where
+        T: Into<NameOrAddress> + Send + Sync,
+    {
+        let at = match at.into() {
+            NameOrAddress::Name(ens_name) => self
+                .inner
+                .resolve_name(&ens_name)
+                .await
+                .map_err(AkulaMiddlewareError::MiddlewareError)?,
+            NameOrAddress::Address(addr) => addr,
+        };
+        let block_id = block.map_or(
+            jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Latest),
+            |block_id| utils::ethers_block_id_to_akula(block_id),
+        );
+
+        self.db_wrapper.get_code(at, block_id).await.map_or_else(
+            |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+            |v| Ok(Bytes::from(v.0)),
+        )
     }
 }

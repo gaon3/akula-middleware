@@ -3,7 +3,7 @@ use akula::{
     kv::{mdbx::*, MdbxWithDirHandle},
 };
 use anyhow::format_err;
-use ethereum_jsonrpc::types as akula_types;
+use ethereum_jsonrpc::types as jsonrpc;
 use ethers::{providers::Middleware, types as ethers_types};
 
 use crate::middleware::{AkulaMiddleware, AkulaMiddlewareError};
@@ -21,29 +21,29 @@ pub fn open_database(
     Ok(db)
 }
 
-pub fn ethers_block_id_to_akula(block_id: ethers_types::BlockId) -> akula_types::BlockId {
+pub fn ethers_block_id_to_akula(block_id: ethers_types::BlockId) -> jsonrpc::BlockId {
     match block_id {
         ethers_types::BlockId::Number(number) => match number {
             ethers_types::BlockNumber::Latest => {
-                akula_types::BlockId::Number(akula_types::BlockNumber::Latest)
+                jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Latest)
             }
             ethers_types::BlockNumber::Earliest => {
-                akula_types::BlockId::Number(akula_types::BlockNumber::Earliest)
+                jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Earliest)
             }
             ethers_types::BlockNumber::Pending => {
-                akula_types::BlockId::Number(akula_types::BlockNumber::Latest)
+                jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Latest)
             }
             ethers_types::BlockNumber::Number(n) => {
-                akula_types::BlockId::Number(akula_types::BlockNumber::Number(n))
+                jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Number(n))
             }
         },
-        ethers_types::BlockId::Hash(hash) => akula_types::BlockId::Hash(hash),
+        ethers_types::BlockId::Hash(hash) => jsonrpc::BlockId::Hash(hash),
     }
 }
 
 pub fn ethers_typed_tx_to_message_call<M: Middleware>(
     typed_transaction: &ethers_types::transaction::eip2718::TypedTransaction,
-) -> Result<akula_types::MessageCall, AkulaMiddlewareError<M>> {
+) -> Result<jsonrpc::MessageCall, AkulaMiddlewareError<M>> {
     let from = typed_transaction.from().map(|addr| *addr);
     let to = if let Some(to) = typed_transaction.to() {
         match to {
@@ -67,8 +67,8 @@ pub fn ethers_typed_tx_to_message_call<M: Middleware>(
     let value = typed_transaction.value().map(|v| ethers_u256_to_ethnum(v));
     let data = typed_transaction
         .data()
-        .map(|data| akula_types::Bytes::from(data.to_vec()));
-    Ok(akula_types::MessageCall {
+        .map(|data| jsonrpc::Bytes::from(data.0));
+    Ok(jsonrpc::MessageCall {
         from,
         to,
         gas,
@@ -83,4 +83,108 @@ pub fn ethers_u256_to_ethnum(n: &ethers_types::U256) -> akula::models::U256 {
     let mut bytes: [u8; 32] = [0; 32];
     n.to_little_endian(&mut bytes);
     akula::models::U256::from_le_bytes(bytes)
+}
+
+#[inline]
+pub fn ethnum_u256_to_ethers(n: &akula::models::U256) -> ethers_types::U256 {
+    let mut bytes = n.to_le_bytes();
+    ethers_types::U256::from_big_endian(&bytes)
+}
+
+pub fn jsonrpc_block_with_txs_to_ethers(
+    block: jsonrpc::Block,
+) -> ethers_types::Block<ethers_types::Transaction> {
+    ethers_types::Block {
+        hash: block.hash,
+        parent_hash: block.parent_hash,
+        author: Some(block.miner),
+        state_root: block.state_root,
+        transactions_root: block.transactions_root,
+        receipts_root: block.receipts_root,
+        number: block.number,
+        gas_used: ethers_types::U256::from(block.gas_used.as_u64()),
+        extra_data: ethers_types::Bytes::from(block.extra_data.0),
+        logs_bloom: block.logs_bloom,
+        timestamp: ethers_types::U256::from(block.timestamp.as_u64()),
+        total_difficulty: block.total_difficulty.map(|v| ethnum_u256_to_ethers(&v)),
+        seal_fields: vec![],
+        transactions: block
+            .transactions
+            .iter()
+            .filter_map(|tx| match tx {
+                jsonrpc::Tx::Transaction(tx) => Some(jsonrpc_tx_to_ethers(tx.as_ref())),
+                jsonrpc::Tx::Hash(_) => None,
+            })
+            .collect(),
+        size: Some(ethers_types::U256::from(block.size.as_u64())),
+        base_fee_per_gas: None,
+        uncles_hash: block.sha3_uncles,
+        gas_limit: ethers_types::U256::from(block.gas_limit.as_u64()),
+        difficulty: ethnum_u256_to_ethers(&block.difficulty),
+        uncles: block.uncles,
+        mix_hash: block.mix_hash,
+        nonce: block.nonce,
+        other: ethers_types::OtherFields::default(),
+    }
+}
+
+pub fn jsonrpc_block_with_hashes_to_ethers(
+    block: jsonrpc::Block,
+) -> ethers_types::Block<ethers_types::H256> {
+    ethers_types::Block {
+        hash: block.hash,
+        parent_hash: block.parent_hash,
+        author: Some(block.miner),
+        state_root: block.state_root,
+        transactions_root: block.transactions_root,
+        receipts_root: block.receipts_root,
+        number: block.number,
+        gas_used: ethers_types::U256::from(block.gas_used.as_u64()),
+        extra_data: ethers_types::Bytes::from(block.extra_data.0),
+        logs_bloom: block.logs_bloom,
+        timestamp: ethers_types::U256::from(block.timestamp.as_u64()),
+        total_difficulty: block.total_difficulty.map(|v| ethnum_u256_to_ethers(&v)),
+        seal_fields: vec![],
+        transactions: block
+            .transactions
+            .iter()
+            .filter_map(|tx| match tx {
+                jsonrpc::Tx::Transaction(_) => None,
+                jsonrpc::Tx::Hash(hash) => Some(*hash),
+            })
+            .collect(),
+        size: Some(ethers_types::U256::from(block.size.as_u64())),
+        base_fee_per_gas: None,
+        uncles_hash: block.sha3_uncles,
+        gas_limit: ethers_types::U256::from(block.gas_limit.as_u64()),
+        difficulty: ethnum_u256_to_ethers(&block.difficulty),
+        uncles: block.uncles,
+        mix_hash: block.mix_hash,
+        nonce: block.nonce,
+        other: ethers_types::OtherFields::default(),
+    }
+}
+pub fn jsonrpc_tx_to_ethers(tx: &jsonrpc::Transaction) -> ethers_types::Transaction {
+    ethers_types::Transaction {
+        hash: tx.hash,
+        nonce: ethers_types::U256::from(tx.nonce.as_u64()),
+        block_hash: tx.block_hash,
+        block_number: tx.block_number,
+        transaction_index: tx.transaction_index,
+        from: tx.from,
+        to: tx.to,
+        value: ethnum_u256_to_ethers(&tx.value),
+        gas: ethers_types::U256::from(tx.gas.as_u64()),
+        gas_price: Some(ethnum_u256_to_ethers(&tx.gas_price)),
+        input: ethers_types::Bytes::from(tx.input.0),
+        v: tx.v,
+        r: ethers_types::U256::from(tx.r.as_fixed_bytes()),
+        s: ethers_types::U256::from(tx.s.as_fixed_bytes()),
+        transaction_type: None,
+        access_list: None,
+        max_priority_fee_per_gas: None,
+        max_fee_per_gas: None,
+        chain_id: None,
+        other: ethers_types::OtherFields::default(),
+    }
 }
