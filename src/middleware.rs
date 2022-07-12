@@ -47,10 +47,7 @@ where
     pub fn new(inner: M, db: Arc<MdbxWithDirHandle<DB>>) -> Self {
         Self {
             inner,
-            db_wrapper: DbWrapper {
-                db,
-                call_gas_limit: 100_000_000,
-            },
+            db_wrapper: DbWrapper::new(db, 100_000_000),
         }
     }
 }
@@ -159,13 +156,11 @@ where
         T: Into<BlockId> + Send + Sync,
     {
         let block_id = utils::ethers_block_id_to_akula(block_hash_or_number.into());
-        self.db_wrapper
-            .get_block(block_id, false)
-            .await
-            .map_or_else(
-                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
-                |v| Ok(v.map(|block| utils::jsonrpc_block_with_txs_to_ethers(block))),
-            )
+
+        self.db_wrapper.get_block(block_id, true).await.map_or_else(
+            |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+            |v| Ok(v.map(|block| utils::jsonrpc_block_with_txs_to_ethers(block))),
+        )
     }
 
     async fn get_transaction<T: Into<TxHash> + Send + Sync>(
@@ -178,6 +173,36 @@ where
             .map_or_else(
                 |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
                 |v| Ok(v.map(|tx| utils::jsonrpc_tx_to_ethers(&tx))),
+            )
+    }
+
+    async fn get_transaction_count<T>(
+        &self,
+        from: T,
+        block_id: Option<BlockId>,
+    ) -> Result<U256, Self::Error>
+    where
+        T: Into<NameOrAddress> + Send + Sync,
+    {
+        let from = match from.into() {
+            NameOrAddress::Name(ens_name) => self
+                .inner
+                .resolve_name(&ens_name)
+                .await
+                .map_err(AkulaMiddlewareError::MiddlewareError)?,
+            NameOrAddress::Address(addr) => addr,
+        };
+        let block_id = block_id.map_or(
+            jsonrpc::BlockId::Number(jsonrpc::BlockNumber::Latest),
+            |block_id| utils::ethers_block_id_to_akula(block_id),
+        );
+
+        self.db_wrapper
+            .get_transaction_count(from, block_id)
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(U256::from(v.as_u64())),
             )
     }
 
@@ -237,5 +262,48 @@ where
             |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
             |v| Ok(Bytes::from(v.0)),
         )
+    }
+
+    async fn get_transaction_receipt<T: Into<TxHash> + Sync + Send>(
+        &self,
+        transaction_hash: T,
+    ) -> Result<Option<TransactionReceipt>, Self::Error> {
+        self.db_wrapper
+            .get_transaction_receipt(transaction_hash.into())
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(v.map(|receipt| utils::jsonrpc_receipt_to_ethers(&receipt))),
+            )
+    }
+
+    async fn get_uncle_count<T: Into<BlockId> + Send + Sync>(
+        &self,
+        block_hash_or_number: T,
+    ) -> Result<U256, Self::Error> {
+        self.db_wrapper
+            .get_uncle_count(utils::ethers_block_id_to_akula(block_hash_or_number.into()))
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(U256::from(v.as_u64())),
+            )
+    }
+
+    async fn get_uncle<T: Into<BlockId> + Send + Sync>(
+        &self,
+        block_hash_or_number: T,
+        idx: U64,
+    ) -> Result<Option<Block<H256>>, Self::Error> {
+        self.db_wrapper
+            .get_uncle_by_block_number_and_index(
+                utils::ethers_block_id_to_akula(block_hash_or_number.into()),
+                idx,
+            )
+            .await
+            .map_or_else(
+                |e| Err(AkulaMiddlewareError::DbWrapperError(e)),
+                |v| Ok(v.map(|uncle| utils::jsonrpc_block_with_hashes_to_ethers(uncle))),
+            )
     }
 }

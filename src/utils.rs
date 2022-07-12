@@ -1,18 +1,18 @@
+use std::collections::HashSet;
+
+use crate::middleware::AkulaMiddlewareError;
 use akula::{
     binutil::AkulaDataDir,
     kv::{mdbx::*, MdbxWithDirHandle},
 };
-use anyhow::format_err;
 use ethereum_jsonrpc::types as jsonrpc;
 use ethers::{providers::Middleware, types as ethers_types};
-
-use crate::middleware::{AkulaMiddleware, AkulaMiddlewareError};
 
 pub fn open_database(
     db_path: impl Into<AkulaDataDir>,
 ) -> anyhow::Result<MdbxWithDirHandle<NoWriteMap>> {
     let db: MdbxWithDirHandle<NoWriteMap> = MdbxEnvironment::<NoWriteMap>::open_ro(
-        akula::kv::Environment::new(),
+        libmdbx::Environment::new(),
         &db_path.into(),
         akula::kv::tables::CHAINDATA_TABLES.clone(),
     )?
@@ -47,7 +47,7 @@ pub fn ethers_typed_tx_to_message_call<M: Middleware>(
     let from = typed_transaction.from().map(|addr| *addr);
     let to = if let Some(to) = typed_transaction.to() {
         match to {
-            ethers_types::NameOrAddress::Address(addr) => *addr,
+            ethers_types::NameOrAddress::Address(addr) => Some(*addr),
             ethers_types::NameOrAddress::Name(_) => {
                 return Err(AkulaMiddlewareError::ConversionError(String::from(
                     "can't convert None to Address",
@@ -55,9 +55,7 @@ pub fn ethers_typed_tx_to_message_call<M: Middleware>(
             }
         }
     } else {
-        return Err(AkulaMiddlewareError::ConversionError(String::from(
-            "can't convert None to Address",
-        )));
+        None
     };
     let gas = typed_transaction.gas().map(|gas| gas.as_u64().into());
     let gas_price = typed_transaction
@@ -67,15 +65,58 @@ pub fn ethers_typed_tx_to_message_call<M: Middleware>(
     let value = typed_transaction.value().map(|v| ethers_u256_to_ethnum(v));
     let data = typed_transaction
         .data()
-        .map(|data| jsonrpc::Bytes::from(data.0));
-    Ok(jsonrpc::MessageCall {
-        from,
-        to,
-        gas,
-        gas_price,
-        value,
-        data,
-    })
+        .map(|data| jsonrpc::Bytes::from(data.0.clone()));
+
+    use ethers_types::transaction::eip2718;
+    match typed_transaction {
+        eip2718::TypedTransaction::Legacy(_) => Ok(jsonrpc::MessageCall::Legacy {
+            from,
+            to,
+            gas,
+            gas_price,
+            value,
+            data,
+        }),
+        eip2718::TypedTransaction::Eip2930(tx) => Ok(jsonrpc::MessageCall::EIP2930 {
+            from,
+            to,
+            gas,
+            gas_price,
+            value,
+            data,
+            access_list: Some(
+                tx.access_list
+                    .0
+                    .iter()
+                    .map(|item| jsonrpc::AccessListEntry {
+                        address: item.address,
+                        storage_keys: HashSet::from_iter(item.storage_keys.iter().cloned()),
+                    })
+                    .collect(),
+            ),
+        }),
+        eip2718::TypedTransaction::Eip1559(tx) => Ok(jsonrpc::MessageCall::EIP1559 {
+            from,
+            to,
+            gas,
+            max_fee_per_gas: tx.max_fee_per_gas.map(|v| ethers_u256_to_ethnum(&v)),
+            max_priority_fee_per_gas: tx
+                .max_priority_fee_per_gas
+                .map(|v| ethers_u256_to_ethnum(&v)),
+            value,
+            data,
+            access_list: Some(
+                tx.access_list
+                    .0
+                    .iter()
+                    .map(|item| jsonrpc::AccessListEntry {
+                        address: item.address,
+                        storage_keys: HashSet::from_iter(item.storage_keys.iter().cloned()),
+                    })
+                    .collect(),
+            ),
+        }),
+    }
 }
 
 #[inline]
@@ -87,7 +128,7 @@ pub fn ethers_u256_to_ethnum(n: &ethers_types::U256) -> akula::models::U256 {
 
 #[inline]
 pub fn ethnum_u256_to_ethers(n: &akula::models::U256) -> ethers_types::U256 {
-    let mut bytes = n.to_le_bytes();
+    let bytes = n.to_le_bytes();
     ethers_types::U256::from_big_endian(&bytes)
 }
 
@@ -164,6 +205,7 @@ pub fn jsonrpc_block_with_hashes_to_ethers(
         other: ethers_types::OtherFields::default(),
     }
 }
+
 pub fn jsonrpc_tx_to_ethers(tx: &jsonrpc::Transaction) -> ethers_types::Transaction {
     ethers_types::Transaction {
         hash: tx.hash,
@@ -176,7 +218,7 @@ pub fn jsonrpc_tx_to_ethers(tx: &jsonrpc::Transaction) -> ethers_types::Transact
         value: ethnum_u256_to_ethers(&tx.value),
         gas: ethers_types::U256::from(tx.gas.as_u64()),
         gas_price: Some(ethnum_u256_to_ethers(&tx.gas_price)),
-        input: ethers_types::Bytes::from(tx.input.0),
+        input: ethers_types::Bytes::from(tx.input.0.clone()),
         v: tx.v,
         r: ethers_types::U256::from(tx.r.as_fixed_bytes()),
         s: ethers_types::U256::from(tx.s.as_fixed_bytes()),
@@ -186,5 +228,47 @@ pub fn jsonrpc_tx_to_ethers(tx: &jsonrpc::Transaction) -> ethers_types::Transact
         max_fee_per_gas: None,
         chain_id: None,
         other: ethers_types::OtherFields::default(),
+    }
+}
+
+pub fn jsonrpc_receipt_to_ethers(
+    tx: &jsonrpc::TransactionReceipt,
+) -> ethers_types::TransactionReceipt {
+    ethers_types::TransactionReceipt {
+        transaction_hash: tx.transaction_hash,
+        block_hash: Some(tx.block_hash),
+        block_number: Some(tx.block_number),
+        transaction_index: tx.transaction_index,
+        from: tx.from,
+        to: tx.to,
+        cumulative_gas_used: ethers_types::U256::from(tx.cumulative_gas_used.as_u64()),
+        gas_used: Some(ethers_types::U256::from(tx.gas_used.as_u64())),
+        contract_address: tx.contract_address,
+        logs: tx
+            .logs
+            .iter()
+            .map(|log| jsonrpc_log_to_ethers(log))
+            .collect(),
+        logs_bloom: tx.logs_bloom,
+        status: Some(tx.status),
+        effective_gas_price: None,
+        transaction_type: None,
+        root: None,
+    }
+}
+
+pub fn jsonrpc_log_to_ethers(log: &jsonrpc::TransactionLog) -> ethers_types::Log {
+    ethers_types::Log {
+        address: log.address,
+        topics: log.topics.clone(),
+        data: ethers_types::Bytes::from(log.data.0.clone()),
+        block_hash: log.block_hash,
+        block_number: log.block_number,
+        transaction_hash: log.transaction_hash,
+        transaction_index: log.transaction_index,
+        log_index: log.log_index.map(|v| ethers_types::U256::from(v.as_u64())),
+        transaction_log_index: None,
+        log_type: None,
+        removed: None,
     }
 }

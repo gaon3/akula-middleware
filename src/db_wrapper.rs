@@ -7,15 +7,11 @@ use akula::{
     kv::{mdbx::*, tables, MdbxWithDirHandle},
     models::*,
     rpc::helpers,
-    stagedsync::stages::{self, FINISH},
+    stagedsync::stages::FINISH,
     Buffer, IntraBlockState,
 };
 use anyhow::format_err;
-use async_trait::async_trait;
-use ethereum_jsonrpc::{
-    types::{self, TransactionLog},
-    EthApiServer, LogFilter, SyncStatus,
-};
+use ethereum_jsonrpc::types;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -25,6 +21,11 @@ where
 {
     db: Arc<MdbxWithDirHandle<DB>>,
     call_gas_limit: u64,
+}
+impl<DB: EnvironmentKind> DbWrapper<DB> {
+    pub fn new(db: Arc<MdbxWithDirHandle<DB>>, call_gas_limit: u64) -> Self {
+        Self { db, call_gas_limit }
+    }
 }
 
 impl<DB> DbWrapper<DB>
@@ -50,11 +51,27 @@ where
 
         let (block_number, block_hash) = helpers::resolve_block_id(&txn, block_id)?
             .ok_or_else(|| format_err!("failed to resolve block {block_id:?}"))?;
+        let chain_id = txn
+            .get(tables::Config, ())?
+            .ok_or_else(|| format_err!("chain spec not found"))?
+            .params
+            .chain_id;
 
         let header = chain::header::read(&txn, block_hash, block_number)?
-            .ok_or_else(|| format_err!("Header not found for #{block_number}/{block_hash}"))?;
+            .ok_or_else(|| format_err!("Header not found for #{block_number}/{block_hash}"))?
+            .into();
 
         let mut buffer = Buffer::new(&txn, Some(block_number));
+
+        let (sender, message) = helpers::convert_message_call(
+            &buffer,
+            chain_id,
+            call_data,
+            &header,
+            U256::ZERO,
+            Some(self.call_gas_limit),
+        )?;
+
         let mut state = IntraBlockState::new(&mut buffer);
 
         let mut analysis_cache = AnalysisCache::default();
@@ -62,34 +79,17 @@ where
             .ok_or_else(|| format_err!("no chainspec found"))?
             .collect_block_spec(block_number);
 
-        let sender = call_data.from.unwrap_or_else(Address::zero);
-
-        let gas_limit = call_data
-            .gas
-            .map(|v| v.as_u64())
-            .unwrap_or(self.call_gas_limit);
-
-        let message = Message::Legacy {
-            chain_id: None,
-            nonce: state.get_nonce(sender)?,
-            gas_price: call_data.gas_price.unwrap_or_default(),
-            gas_limit,
-            action: TransactionAction::Call(call_data.to),
-            value: call_data.value.unwrap_or_default(),
-            input: call_data.data.unwrap_or_default().into(),
-        };
-
         let mut tracer = NoopTracer;
 
         Ok(evmglue::execute(
             &mut state,
             &mut tracer,
             &mut analysis_cache,
-            &PartialHeader::from(header),
+            &header,
             &block_spec,
             &message,
             sender,
-            gas_limit,
+            message.gas_limit(),
         )?
         .output_data
         .into())
@@ -103,26 +103,22 @@ where
         let txn = self.db.begin()?;
         let (block_number, hash) = helpers::resolve_block_id(&txn, block_number)?
             .ok_or_else(|| format_err!("failed to resolve block {block_number:?}"))?;
+
+        let chain_id = txn
+            .get(tables::Config, ())?
+            .ok_or_else(|| format_err!("chain spec not found"))?
+            .params
+            .chain_id;
         let header = chain::header::read(&txn, hash, block_number)?
-            .ok_or_else(|| format_err!("no header found for block #{block_number}/{hash}"))?;
+            .ok_or_else(|| format_err!("no header found for block #{block_number}/{hash}"))?
+            .into();
         let mut buffer = Buffer::new(&txn, Some(block_number));
+
+        let (sender, message) =
+            helpers::convert_message_call(&buffer, chain_id, call_data, &header, U256::ZERO, None)?;
+
         let mut state = IntraBlockState::new(&mut buffer);
-        let sender = call_data.from.unwrap_or_else(Address::zero);
-        let message = Message::Legacy {
-            chain_id: None,
-            nonce: state.get_nonce(sender)?,
-            gas_price: call_data
-                .gas_price
-                .map(|v| v.as_u64().as_u256())
-                .unwrap_or(U256::ZERO),
-            gas_limit: call_data
-                .gas
-                .map(|gas| gas.as_u64())
-                .unwrap_or(header.gas_limit),
-            action: TransactionAction::Call(call_data.to),
-            value: call_data.value.unwrap_or(U256::ZERO),
-            input: call_data.data.unwrap_or_default().into(),
-        };
+
         let mut cache = AnalysisCache::default();
         let block_spec = chain::chain_config::read(&txn)?
             .ok_or_else(|| format_err!("no chainspec found"))?
@@ -136,7 +132,7 @@ where
                     &mut state,
                     &mut tracer,
                     &mut cache,
-                    &PartialHeader::from(header),
+                    &header,
                     &block_spec,
                     &message,
                     sender,
@@ -265,5 +261,150 @@ where
             key,
             Some(block_number),
         )?)
+    }
+
+    pub async fn get_transaction_count(
+        &self,
+        address: Address,
+        block_id: types::BlockId,
+    ) -> anyhow::Result<U64> {
+        let txn = self.db.begin()?;
+        let (block_number, _) = helpers::resolve_block_id(&txn, block_id)?
+            .ok_or_else(|| format_err!("failed to resolve block {block_id:?}"))?;
+
+        Ok(state::account::read(&txn, address, Some(block_number))?
+            .map(|account| account.nonce)
+            .unwrap_or(0)
+            .into())
+    }
+
+    pub async fn get_transaction_receipt(
+        &self,
+        hash: H256,
+    ) -> anyhow::Result<Option<types::TransactionReceipt>> {
+        let txn = self.db.begin()?;
+
+        if let Some(block_number) = chain::tl::read(&txn, hash)? {
+            let block_hash = chain::canonical_hash::read(&txn, block_number)?
+                .ok_or_else(|| format_err!("no canonical header for block #{block_number:?}"))?;
+            let header = PartialHeader::from(
+                chain::header::read(&txn, block_hash, block_number)?.ok_or_else(|| {
+                    format_err!("header not found for block #{block_number}/{block_hash}")
+                })?,
+            );
+            let block_body = chain::block_body::read_with_senders(&txn, block_hash, block_number)?
+                .ok_or_else(|| {
+                    format_err!("body not found for block #{block_number}/{block_hash}")
+                })?;
+            let chain_spec = chain::chain_config::read(&txn)?
+                .ok_or_else(|| format_err!("chain specification not found"))?;
+
+            // Prepare the execution context.
+            let mut buffer = Buffer::new(&txn, Some(BlockNumber(block_number.0 - 1)));
+
+            let block_execution_spec = chain_spec.collect_block_spec(block_number);
+            let mut engine = engine_factory(None, chain_spec)?;
+            let mut analysis_cache = AnalysisCache::default();
+            let mut tracer = NoopTracer;
+
+            let mut processor = ExecutionProcessor::new(
+                &mut buffer,
+                &mut tracer,
+                &mut analysis_cache,
+                &mut *engine,
+                &header,
+                &block_body,
+                &block_execution_spec,
+            );
+
+            let transaction_index = chain::block_body::read_without_senders(&txn, block_hash, block_number)?.ok_or_else(|| format_err!("where's block body"))?.transactions
+                    .into_iter()
+                    .enumerate()
+                    .find(|(_, tx)| tx.hash() == hash)
+                    .ok_or_else(|| format_err!("transaction {hash} not found in block #{block_number}/{block_hash} despite lookup index"))?.0;
+
+            let receipts =
+                processor.execute_block_no_post_validation_while(|i, _| i <= transaction_index)?;
+
+            let transaction = &block_body.transactions[transaction_index];
+            let receipt = receipts.get(transaction_index).unwrap();
+            let gas_used = U64::from(
+                receipt.cumulative_gas_used
+                    - transaction_index
+                        .checked_sub(1)
+                        .and_then(|last_index| receipts.get(last_index))
+                        .map(|receipt| receipt.cumulative_gas_used)
+                        .unwrap_or(0),
+            );
+            let logs = receipt
+                .logs
+                .iter()
+                .enumerate()
+                .map(|(i, log)| types::TransactionLog {
+                    log_index: Some(U64::from(i)),
+                    transaction_index: Some(U64::from(transaction_index)),
+                    transaction_hash: Some(transaction.hash()),
+                    block_hash: Some(block_hash),
+                    block_number: Some(U64::from(block_number.0)),
+                    address: log.address,
+                    data: log.data.clone().into(),
+                    topics: log.topics.clone(),
+                })
+                .collect::<Vec<_>>();
+
+            return Ok(Some(types::TransactionReceipt {
+                transaction_hash: hash,
+                transaction_index: U64::from(transaction_index),
+                block_hash,
+                block_number: U64::from(block_number.0),
+                from: transaction.sender,
+                to: transaction.message.action().into_address(),
+                cumulative_gas_used: receipt.cumulative_gas_used.into(),
+                gas_used,
+                contract_address: if let TransactionAction::Create = transaction.message.action() {
+                    Some(akula::execution::address::create_address(
+                        transaction.sender,
+                        transaction.message.nonce(),
+                    ))
+                } else {
+                    None
+                },
+                logs,
+                logs_bloom: receipt.bloom,
+                status: if receipt.success {
+                    U64::from(1_u16)
+                } else {
+                    U64::zero()
+                },
+            }));
+        }
+
+        Ok(None)
+    }
+
+    pub async fn get_uncle_by_block_number_and_index(
+        &self,
+        block_id: types::BlockId,
+        index: U64,
+    ) -> anyhow::Result<Option<types::Block>> {
+        let txn = self.db.begin()?;
+        Ok(helpers::construct_block(
+            &txn,
+            block_id,
+            false,
+            Some(index),
+        )?)
+    }
+
+    pub async fn get_uncle_count(&self, block_id: types::BlockId) -> anyhow::Result<U64> {
+        let txn = self.db.begin()?;
+        let (block_number, block_hash) = helpers::resolve_block_id(&txn, block_id)?
+            .ok_or_else(|| format_err!("failed to resolve block {block_id:?}"))?;
+
+        Ok(U64::from(
+            chain::storage_body::read(&txn, block_hash, block_number)?
+                .map(|body| body.uncles.len())
+                .unwrap_or(0),
+        ))
     }
 }
